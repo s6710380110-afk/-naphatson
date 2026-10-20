@@ -1,0 +1,6 @@
+{
+  "name": "KlangPanya - คลังปัญญาเพื่อการศึกษาไทย",
+  "description": "แพลตฟอร์มรวบรวมและแบ่งปันสื่อความรู้สำหรับนักเรียน นักศึกษา และครูอาจารย์ พร้อมระบบสมาชิก คลังความรู้ และระบบจัดการผู้ดูแล",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

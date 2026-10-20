@@ -1,0 +1,198 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default deny all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-\\.]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    // Bootstrapped admin by verified email or explicit admin record or user profile role
+    function isSuperAdmin() {
+      return isSignedIn() && (
+        request.auth.token.email == 's6710380110@pkru.ac.th' ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    function isAdmin() {
+      return isSuperAdmin() || (
+        isSignedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin'
+      );
+    }
+
+    function isModerator() {
+      return isAdmin() || (
+        isSignedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role in ['admin', 'moderator']
+      );
+    }
+
+    function isActiveUser() {
+      return isSignedIn() && (
+        !exists(/databases/$(database)/documents/users/$(request.auth.uid)) ||
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.status != 'suspended'
+      );
+    }
+
+    // Validation functions
+    function isValidUser(data) {
+      return data.uid is string && data.uid.size() <= 128 &&
+             data.email is string && data.email.size() <= 150 &&
+             data.displayName is string && data.displayName.size() <= 100 &&
+             data.role in ['guest', 'member', 'moderator', 'admin'] &&
+             data.status in ['active', 'suspended'];
+    }
+
+    function isValidResource(data) {
+      return data.title is string && data.title.size() >= 3 && data.title.size() <= 200 &&
+             data.description is string && data.description.size() >= 5 && data.description.size() <= 3000 &&
+             data.category is string && data.category.size() <= 50 &&
+             data.educationLevel is string && data.educationLevel.size() <= 50 &&
+             data.mediaType in ['pdf', 'video', 'website', 'slide', 'code', 'image', 'other'] &&
+             data.url is string && data.url.size() <= 1000 &&
+             data.authorId is string && data.authorId.size() <= 128 &&
+             data.authorName is string && data.authorName.size() <= 100 &&
+             data.status in ['published', 'hidden', 'deleted'];
+    }
+
+    function isValidFavorite(data) {
+      return data.userId is string && data.userId.size() <= 128 &&
+             data.resourceId is string && data.resourceId.size() <= 128 &&
+             data.resourceTitle is string && data.resourceTitle.size() <= 200;
+    }
+
+    function isValidReport(data) {
+      return data.resourceId is string && data.resourceId.size() <= 128 &&
+             data.reportedBy is string && data.reportedBy.size() <= 128 &&
+             data.reason in ['broken_link', 'copyright', 'inappropriate', 'inaccurate', 'other'] &&
+             data.status in ['pending', 'resolved', 'dismissed'];
+    }
+
+    function isValidSettings(data) {
+      return data.siteName is string && data.siteName.size() <= 100 &&
+             data.siteDescription is string && data.siteDescription.size() <= 500;
+    }
+
+    // 1. Users collection
+    match /users/{userId} {
+      allow get: if isSignedIn();
+      allow list: if isModerator();
+      
+      // Creating own user profile with default role/status (or super admin bootstrapped)
+      allow create: if isOwner(userId) && isValidUser(incoming()) && (
+        (incoming().role == 'member' && incoming().status == 'active') ||
+        (request.auth.token.email == 's6710380110@pkru.ac.th' && incoming().role == 'admin') ||
+        isAdmin()
+      );
+
+      // Updating user profile:
+      // - regular users can update displayName, bio, institution, photoURL, but CANNOT change role or status
+      // - admins can update any field including role and status
+      allow update: if isValidUser(incoming()) && (
+        isAdmin() ||
+        (isOwner(userId) &&
+         incoming().role == existing().role &&
+         incoming().status == existing().status &&
+         incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL', 'bio', 'institution', 'updatedAt']))
+      );
+
+      allow delete: if isAdmin();
+    }
+
+    // Admins index collection for superadmin tracking
+    match /admins/{adminId} {
+      allow read: if isSignedIn();
+      allow write: if isSuperAdmin();
+    }
+
+    // 2. Resources collection
+    match /resources/{resourceId} {
+      // Anyone (even guest) can read published resources
+      // Authors and moderators can read hidden/deleted resources
+      allow get: if resource.data.status == 'published' ||
+                    (isSignedIn() && (resource.data.authorId == request.auth.uid || isModerator()));
+      
+      allow list: if true; // Filtered by status == 'published' in queries
+
+      // Active members can create resources where authorId matches auth uid
+      allow create: if isActiveUser() &&
+                       isValidResource(incoming()) &&
+                       incoming().authorId == request.auth.uid &&
+                       incoming().status in ['published', 'hidden'];
+
+      // Update: author can update content/status, or anyone can increment viewsCount/likesCount, or moderator can moderate
+      allow update: if (
+        isModerator() ||
+        (isActiveUser() && isOwner(existing().authorId) && isValidResource(incoming()) && incoming().authorId == existing().authorId) ||
+        (incoming().diff(existing()).affectedKeys().hasOnly(['viewsCount', 'likesCount', 'reportsCount']))
+      );
+
+      allow delete: if isModerator() || (isSignedIn() && isOwner(existing().authorId));
+    }
+
+    // 3. Favorites collection
+    match /favorites/{favoriteId} {
+      allow get: if isSignedIn() && (resource.data.userId == request.auth.uid || isModerator());
+      allow list: if isSignedIn(); // client filters by userId == request.auth.uid
+      
+      allow create: if isActiveUser() &&
+                       isValidFavorite(incoming()) &&
+                       incoming().userId == request.auth.uid;
+      
+      allow update: if false; // Favorites are atomic create or delete
+      allow delete: if isSignedIn() && (existing().userId == request.auth.uid || isModerator());
+    }
+
+    // 4. Reports collection
+    match /reports/{reportId} {
+      allow get: if isModerator() || (isSignedIn() && resource.data.reportedBy == request.auth.uid);
+      allow list: if isModerator();
+
+      allow create: if isActiveUser() &&
+                       isValidReport(incoming()) &&
+                       incoming().reportedBy == request.auth.uid &&
+                       incoming().status == 'pending';
+
+      allow update: if isModerator() && isValidReport(incoming());
+      allow delete: if isAdmin();
+    }
+
+    // 5. Moderation Logs collection
+    match /moderationLogs/{logId} {
+      allow read: if isModerator();
+      allow create: if isModerator() && incoming().adminId == request.auth.uid;
+      allow update, delete: if false; // Append-only audit trail
+    }
+
+    // 6. Settings collection
+    match /settings/{settingId} {
+      allow read: if true; // Public site branding, announcement, categories
+      allow write: if isAdmin() && isValidSettings(incoming());
+    }
+  }
+}
